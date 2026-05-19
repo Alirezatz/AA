@@ -1,14 +1,14 @@
-name: TelegramDownloader
+name: TelegramDownloader-Optimized
 
 on:
   workflow_dispatch:
     inputs:
       telegram_links:
-        description: '🔗 Telegram post links (separate with space)'
+        description: '🔗 لینک پست‌های تلگرام (با فاصله جدا کنید)'
         required: true
         type: string
       split_threshold_mb:
-        description: '📦 Maximum file size per part (MB)'
+        description: '📦 حداکثر حجم هر بخش (مگابایت)'
         required: false
         type: number
         default: 90
@@ -18,375 +18,323 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
+
     steps:
-      - name: 📂 Setup workspace
+      - name: 📂 دریافت مخزن
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🔧 Install core tools
+      - name: ⚡ نصب ابزارها
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl jq zip unzip aria2 bc
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl jq zip unzip bc aria2
 
-      - name: 💾 Load cached proxy
-        id: load_proxy
+      # ------------------------------------------------------------
+      # کش پروکسی با cache رسمی گیت‌هاب
+      # ------------------------------------------------------------
+      - name: 💾 بازیابی پروکسی کش‌شده
+        id: cache-proxy
+        uses: actions/cache@v4
+        with:
+          path: .proxy_cache
+          key: telegram-proxy-${{ hashFiles('.github/workflows/*.yml') }}-v1
+          restore-keys: |
+            telegram-proxy-
+
+      - name: 🚀 کشف/تأیید پروکسی فعال
+        id: proxy
         run: |
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "💾 Loading cached proxy list..."
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          mkdir -p .cache
-          CACHED_PROXY=""
-          
-          if [ -f ".cache/working_proxy.txt" ]; then
-            CACHED_PROXY=$(cat .cache/working_proxy.txt)
-            echo "📦 Found cached proxy: $CACHED_PROXY"
-            
-            if curl -s -x "http://$CACHED_PROXY" \
-              --max-time 5 \
-              --connect-timeout 3 \
-              -k \
+          mkdir -p .proxy_cache
+          CACHED_FILE=".proxy_cache/working_proxy.txt"
+          SELECTED_PROXY=""
+
+          # اگر پروکسی کش شده وجود داشت، آن را تست کنیم
+          if [ -f "$CACHED_FILE" ]; then
+            CANDIDATE=$(cat "$CACHED_FILE")
+            echo "🔍 بررسی پروکسی کش‌شده: $CANDIDATE"
+            if curl -s -x "http://$CANDIDATE" \
+              --max-time 5 --connect-timeout 3 -k \
               'https://telegramdownloader.net/proxy.php' \
               -X POST \
-              -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
               -H 'Content-Type: application/x-www-form-urlencoded' \
               --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' \
               --compressed 2>/dev/null | grep -q '"success"'; then
-              
-              echo "✅ Cached proxy is still working!"
-              echo "selected_proxy=$CACHED_PROXY" >> $GITHUB_OUTPUT
+              SELECTED_PROXY="$CANDIDATE"
+              echo "✅ پروکسی کش معتبر است"
             else
-              echo "⚠️ Cached proxy is dead, will search for new one"
-              echo "selected_proxy=" >> $GITHUB_OUTPUT
+              echo "⚠️ پروکسی کش مرده است، حذف می‌شود"
+              rm -f "$CACHED_FILE"
             fi
-          else
-            echo "ℹ️ No cached proxy found"
-            echo "selected_proxy=" >> $GITHUB_OUTPUT
           fi
 
-      - name: 🚀 Proxy discovery (if needed)
-        id: find_proxy
-        if: steps.load_proxy.outputs.selected_proxy == ''
-        run: |
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🔍 Initializing proxy discovery engine..."
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          curl -s 'https://raw.githubusercontent.com/Ian-Lusule/Proxies/main/proxies/http.txt' 2>/dev/null | \
-            grep -v '^0\.0\.0\.0' | \
-            grep -v '^127\.0\.0\.1' | \
-            head -300 > proxy_list.txt 2>/dev/null
-          
-          SELECTED_PROXY=""
-          TEST_COUNT=0
-          TOTAL_PROXIES=$(wc -l < proxy_list.txt 2>/dev/null)
-          
-          if [ -z "$TOTAL_PROXIES" ] || [ "$TOTAL_PROXIES" -eq 0 ]; then
-            SELECTED_PROXY="DIRECT"
-          else
+          # اگر پروکسی معتبر نداشتیم، لیست جدید را امتحان کنیم
+          if [ -z "$SELECTED_PROXY" ]; then
+            echo "🔍 دانلود لیست پروکسی‌های جدید..."
+            curl -s 'https://raw.githubusercontent.com/Ian-Lusule/Proxies/main/proxies/http.txt' 2>/dev/null | \
+              grep -vE '^(0\.0\.0\.0|127\.0\.0\.1)' | head -300 > proxy_list.txt
+
+            TOTAL_PROXIES=$(wc -l < proxy_list.txt)
+            TEST_COUNT=0
             while IFS= read -r proxy_addr; do
               proxy_addr=$(echo "$proxy_addr" | xargs)
               [ -z "$proxy_addr" ] && continue
-              
               TEST_COUNT=$((TEST_COUNT + 1))
-              echo -n "[${TEST_COUNT}/${TOTAL_PROXIES}] Validating ${proxy_addr} ... "
-              
+              echo -n "[$TEST_COUNT/$TOTAL_PROXIES] تست $proxy_addr ... "
               if curl -s -x "http://${proxy_addr}" \
-                --max-time 4 \
-                --connect-timeout 2 \
-                -k \
+                --max-time 4 --connect-timeout 2 -k \
                 'https://telegramdownloader.net/proxy.php' \
                 -X POST \
-                -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
                 -H 'Content-Type: application/x-www-form-urlencoded' \
                 --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' \
                 --compressed 2>/dev/null | grep -q '"success"'; then
-                
-                echo " ✓ ACTIVE"
+                echo "✅ فعال"
                 SELECTED_PROXY="$proxy_addr"
+                echo "$SELECTED_PROXY" > "$CACHED_FILE"
                 break
               else
-                echo " ✗ DEAD"
+                echo "❌ غیرفعال"
               fi
-            done < proxy_list.txt 2>/dev/null
+            done < proxy_list.txt
           fi
-          
+
+          # اگر هیچ پروکسی پیدا نشد، حالت مستقیم
           if [ -z "$SELECTED_PROXY" ]; then
             SELECTED_PROXY="DIRECT"
-          else
-            mkdir -p .cache
-            echo "$SELECTED_PROXY" > .cache/working_proxy.txt
-            echo "💾 Saved working proxy to cache"
+            echo "ℹ️ استفاده از اتصال مستقیم (بدون پروکسی)"
           fi
-          
+
           echo "selected_proxy=$SELECTED_PROXY" >> $GITHUB_OUTPUT
-          echo ""
-          echo "✅ Active proxy: $SELECTED_PROXY"
+          echo "🎯 پروکسی نهایی: $SELECTED_PROXY"
 
-      - name: Use cached or discovered proxy
-        id: final_proxy
-        run: |
-          if [ -n "${{ steps.load_proxy.outputs.selected_proxy }}" ]; then
-            echo "selected_proxy=${{ steps.load_proxy.outputs.selected_proxy }}" >> $GITHUB_OUTPUT
-            echo "✅ Using cached proxy: ${{ steps.load_proxy.outputs.selected_proxy }}"
-          else
-            echo "selected_proxy=${{ steps.find_proxy.outputs.selected_proxy }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 📡 Process each link
-        id: process_all
+      # ------------------------------------------------------------
+      # دانلود همزمان همه لینک‌ها
+      # ------------------------------------------------------------
+      - name: 📡 دانلود موازی لینک‌ها
+        id: download_all
         run: |
           LINKS="${{ github.event.inputs.telegram_links }}"
-          PROXY="${{ steps.final_proxy.outputs.selected_proxy }}"
-          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
-          
+          PROXY="${{ steps.proxy.outputs.selected_proxy }}"
+          THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
-          
-          mkdir -p downloads
-          
-          fix_url() {
-            echo "$1" | sed 's/ /-/g' | sed 's/%20/-/g'
-          }
-          
-          create_safe_folder_name() {
-            echo "$1" | sed 's/[<>:"|?*\\/@#\$%^&!~`+=;,.]/_/g' | sed 's/ /_/g' | sed 's/__*/_/g' | cut -c1-80
-          }
-          
-          sanitize_filename() {
-            echo "$1" | sed 's/%20/-/g' | sed 's/%40/@/g' | sed 's/[[:space:]]/-/g' | sed 's/--*/-/g' | sed 's/[^a-zA-Z0-9.@_-]//g'
-          }
-          
-          urlencode() {
-            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-          }
-          
+
+          mkdir -p downloads logs
+
+          # توابع کمکی
+          fix_url() { echo "$1" | sed 's/ /-/g; s/%20/-/g'; }
+          safe_folder() { echo "$1" | sed 's/[<>:"|?*\\/@#\$%^&!~`+=;,.]/_/g; s/ /_/g; s/__*/_/g' | cut -c1-80; }
+          sanitize_name() { echo "$1" | sed 's/%20/-/g; s/%40/@/g; s/[[:space:]]/-/g; s/--*/-/g; s/[^a-zA-Z0-9.@_-]//g'; }
+          urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
+
+          # تابع دانلود یک لینک (در بک‌گراند اجرا می‌شود)
           download_one() {
             local TELEGRAM_LINK="$1"
             local INDEX="$2"
-            
-            echo ""
-            echo "═══════════════════════════════════════════════════════════════"
-            echo "📥 Processing [$INDEX]: $TELEGRAM_LINK"
-            echo "═══════════════════════════════════════════════════════════════"
-            
+            local LOGFILE="logs/link_${INDEX}.log"
+            exec 3>&1 4>&2  # ذخیره stdout/stderr اصلی
+            exec > "$LOGFILE" 2>&1  # خروجی‌ها به فایل لاگ
+
+            echo "شروع دانلود #$INDEX: $TELEGRAM_LINK"
+
+            # دریافت اطلاعات از سرویس
             if [ "$PROXY" = "DIRECT" ]; then
               RESPONSE=$(curl -s -X POST \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -H "Accept: */*" \
-                -H "Referer: https://telegramdownloader.net/" \
                 -H "Content-Type: application/x-www-form-urlencoded" \
                 --data-raw "telegram_link=$TELEGRAM_LINK" \
-                --compressed \
-                https://telegramdownloader.net/proxy.php)
+                --compressed https://telegramdownloader.net/proxy.php)
             else
               RESPONSE=$(curl -s -x "http://$PROXY" -X POST \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -H "Accept: */*" \
-                -H "Referer: https://telegramdownloader.net/" \
                 -H "Content-Type: application/x-www-form-urlencoded" \
                 --data-raw "telegram_link=$TELEGRAM_LINK" \
-                --compressed \
-                https://telegramdownloader.net/proxy.php)
+                --compressed https://telegramdownloader.net/proxy.php)
             fi
-            
+
             RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
             ORIGINAL_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
-            
+
             if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-              echo "❌ Failed to get download link for $TELEGRAM_LINK"
+              echo "FAILED:API" > "logs/status_${INDEX}.txt"
+              exec 1>&3 2>&4  # بازیابی خروجی اصلی
               return 1
             fi
-            
+
+            CLEAN_NAME=$(sanitize_name "$ORIGINAL_NAME")
+            FOLDER_NAME=$(safe_folder "${CLEAN_NAME%.*}")
+            DOWNLOAD_DIR="downloads/$FOLDER_NAME"
+            mkdir -p "$DOWNLOAD_DIR"
+
+            echo "📥 دانلود فایل: $ORIGINAL_NAME"
             FIXED_URL=$(fix_url "$RAW_URL")
-            CLEAN_NAME=$(sanitize_filename "$ORIGINAL_NAME")
-            FOLDER_NAME=$(create_safe_folder_name "${CLEAN_NAME%.*}")
-            DOWNLOAD_PATH="downloads/$FOLDER_NAME"
-            mkdir -p "$DOWNLOAD_PATH"
-            
-            echo "✅ Source acquired: $ORIGINAL_NAME"
-            echo "🧹 Cleaned name: $CLEAN_NAME"
-            echo "📁 Folder: $FOLDER_NAME"
-            echo "📥 Downloading: $ORIGINAL_NAME"
-            
+
+            # دانلود با aria2c (تلاش دوباره تا ۵ بار)
             aria2c \
-              --max-connection-per-server=4 \
-              --split=4 \
-              --min-split-size=10M \
+              --max-connection-per-server=8 \
+              --split=8 \
+              --min-split-size=5M \
               --max-tries=5 \
-              --retry-wait=5 \
-              --timeout=60 \
+              --retry-wait=3 \
+              --timeout=120 \
               --connect-timeout=30 \
               --allow-overwrite=true \
               --auto-file-renaming=false \
-              --summary-interval=1 \
               --console-log-level=error \
-              --dir="$DOWNLOAD_PATH" \
+              --dir="$DOWNLOAD_DIR" \
               --out="$ORIGINAL_NAME" \
-              "$FIXED_URL"
-            
-            if [ ! -f "$DOWNLOAD_PATH/$ORIGINAL_NAME" ]; then
-              echo "❌ Download failed: $ORIGINAL_NAME"
-              return 1
-            fi
-            
+              "$FIXED_URL" || {
+                echo "FAILED:DOWNLOAD" > "logs/status_${INDEX}.txt"
+                exec 1>&3 2>&4
+                return 1
+              }
+
+            # تغییر نام به نسخه تمیز
             if [ "$ORIGINAL_NAME" != "$CLEAN_NAME" ]; then
-              mv "$DOWNLOAD_PATH/$ORIGINAL_NAME" "$DOWNLOAD_PATH/$CLEAN_NAME"
-              echo "🔄 Renamed: $ORIGINAL_NAME → $CLEAN_NAME"
+              mv "$DOWNLOAD_DIR/$ORIGINAL_NAME" "$DOWNLOAD_DIR/$CLEAN_NAME"
             fi
-            
-            FILE_SIZE=$(stat -c%s "$DOWNLOAD_PATH/$CLEAN_NAME")
-            
+
+            FILE_SIZE=$(stat -c%s "$DOWNLOAD_DIR/$CLEAN_NAME")
             if [ "$FILE_SIZE" -lt 10000 ]; then
-              echo "❌ Invalid file (only ${FILE_SIZE} bytes): $CLEAN_NAME"
-              rm "$DOWNLOAD_PATH/$CLEAN_NAME"
+              echo "FAILED:TOO_SMALL" > "logs/status_${INDEX}.txt"
+              rm -f "$DOWNLOAD_DIR/$CLEAN_NAME"
+              exec 1>&3 2>&4
               return 1
             fi
-            
+
             SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-            echo "✅ Downloaded: ${SIZE_MB} MB - $CLEAN_NAME"
-            
-            LIMIT=$((THRESHOLD * 1024 * 1024))
+            echo "✅ دانلود شد: ${SIZE_MB} مگابایت - $CLEAN_NAME"
+
+            # تقسیم فایل در صورت لزوم
             SPLIT_FILES=()
-            
-            if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ] && [ "$THRESHOLD" != "0" ]; then
-              echo "✂️ Splitting into ${THRESHOLD}MB parts..."
-              cd "$DOWNLOAD_PATH"
-              zip -s "${THRESHOLD}m" "${CLEAN_NAME}.zip" -j "$CLEAN_NAME"
-              rm "$CLEAN_NAME"
-              
+            LIMIT=$((THRESHOLD_MB * 1024 * 1024))
+            if [ "$FILE_SIZE" -gt "$LIMIT" ] && [ "$THRESHOLD_MB" != "0" ]; then
+              echo "✂️ تقسیم فایل به قطعات ${THRESHOLD_MB}مگی..."
+              cd "$DOWNLOAD_DIR"
+              zip -s "${THRESHOLD_MB}m" "${CLEAN_NAME}.zip" -j "$CLEAN_NAME" && rm "$CLEAN_NAME"
               if [ -f "${CLEAN_NAME}.zip" ]; then
                 SPLIT_FILES+=("${CLEAN_NAME}.zip")
               fi
-              
-              for i in $(seq -w 1 99); do
-                PART_FILE="${CLEAN_NAME}.z${i}"
-                if [ -f "$PART_FILE" ]; then
-                  SPLIT_FILES+=("$PART_FILE")
-                else
-                  break
-                fi
+              for part in "${CLEAN_NAME}".z*; do
+                [ -f "$part" ] && SPLIT_FILES+=("$part")
               done
-              cd ../..
+              cd - > /dev/null
             else
               SPLIT_FILES=("$CLEAN_NAME")
             fi
-            
-            GITHUB_LINKS_FILE="$DOWNLOAD_PATH/github_links.txt"
+
+            # ساخت فایل لینک‌های گیت‌هاب
+            GITHUB_LINKS_FILE="$DOWNLOAD_DIR/github_links.txt"
             ENCODED_FOLDER=$(urlencode "$FOLDER_NAME")
-            
             > "$GITHUB_LINKS_FILE"
             for file in "${SPLIT_FILES[@]}"; do
               ENCODED_FILE=$(urlencode "$file")
-              GITHUB_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/downloads/${ENCODED_FOLDER}/${ENCODED_FILE}"
-              echo "$GITHUB_LINK" >> "$GITHUB_LINKS_FILE"
+              echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/downloads/${ENCODED_FOLDER}/${ENCODED_FILE}" >> "$GITHUB_LINKS_FILE"
             done
-            
-            echo "📝 GitHub links saved to: $GITHUB_LINKS_FILE"
-            echo "📊 Total split files: ${#SPLIT_FILES[@]}"
-            echo "📋 Links generated:"
-            cat "$GITHUB_LINKS_FILE"
-            
+
+            echo "SUCCESS" > "logs/status_${INDEX}.txt"
+            exec 1>&3 2>&4  # بازیابی خروجی اصلی
             return 0
           }
-          
-          LINK_ARRAY=($LINKS)
-          TOTAL_LINKS=${#LINK_ARRAY[@]}
-          SUCCESS_COUNT=0
-          FAIL_COUNT=0
-          
-          echo ""
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📊 Total links to process: $TOTAL_LINKS"
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          for i in "${!LINK_ARRAY[@]}"; do
-            LINK="${LINK_ARRAY[$i]}"
+
+          # اجرای موازی همه لینک‌ها
+          declare -a PIDS
+          IFS=' ' read -ra LINKS_ARRAY <<< "$LINKS"
+          TOTAL_LINKS=${#LINKS_ARRAY[@]}
+          echo "🚀 شروع دانلود $TOTAL_LINKS لینک به‌صورت همزمان..."
+
+          for i in "${!LINKS_ARRAY[@]}"; do
             INDEX=$((i + 1))
-            
-            if download_one "$LINK" "$INDEX"; then
-              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            download_one "${LINKS_ARRAY[$i]}" "$INDEX" &
+            PIDS[$i]=$!
+          done
+
+          # منتظر پایان همه فرآیندها
+          for pid in "${PIDS[@]}"; do
+            wait "$pid"
+          done
+
+          # جمع‌بندی نتایج
+          SUCCESS=0
+          FAIL=0
+          for i in $(seq 1 $TOTAL_LINKS); do
+            if [ -f "logs/status_${i}.txt" ]; then
+              STATUS=$(cat "logs/status_${i}.txt")
+              if [ "$STATUS" = "SUCCESS" ]; then
+                SUCCESS=$((SUCCESS + 1))
+              else
+                FAIL=$((FAIL + 1))
+              fi
             else
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-            fi
-            
-            if [ $INDEX -lt $TOTAL_LINKS ]; then
-              echo ""
-              echo "⏳ Waiting 3 seconds before next download..."
-              sleep 3
+              FAIL=$((FAIL + 1))
             fi
           done
-          
-          echo ""
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📊 Processing complete!"
-          echo "✅ Successful: $SUCCESS_COUNT"
-          echo "❌ Failed: $FAIL_COUNT"
-          echo "📁 Files saved in: downloads/[file_name_folder]/"
-          echo "📝 Each folder contains: github_links.txt (GitHub download links)"
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
-          echo "fail_count=$FAIL_COUNT" >> $GITHUB_OUTPUT
 
-      - name: 📤 Deploy to repository
+          echo "success_count=$SUCCESS" >> $GITHUB_OUTPUT
+          echo "fail_count=$FAIL" >> $GITHUB_OUTPUT
+
+          echo "📊 دانلودها تمام شدند: $SUCCESS موفق، $FAIL ناموفق"
+          # نمایش لاگ‌های خلاصه
+          for f in logs/link_*.log; do
+            echo "────── لاگ $(basename "$f") ──────"
+            tail -5 "$f"
+          done
+
+      # ------------------------------------------------------------
+      # انتشار فایل‌ها در مخزن
+      # ------------------------------------------------------------
+      - name: 📤 انتشار در مخزن
+        if: steps.download_all.outputs.success_count > 0
         run: |
           git config user.name "TelegramDownloader-bot"
           git config user.email "telegramdownloader@local"
-          
-          if [ ! -d "downloads" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
-            echo "⚠️ No assets to deploy"
-            exit 0
-          fi
-          
-          git fetch origin main
-          git pull origin main --rebase || true
-          
-          git add downloads/ .cache/ 2>/dev/null || true
-          
+
+          git fetch origin "${{ github.ref_name }}"
+          git pull origin "${{ github.ref_name }}" --rebase || true
+
+          git add downloads/ logs/ 2>/dev/null || true
+
           if git diff --cached --quiet; then
-            echo "✅ No new changes to commit"
+            echo "✅ تغییر تازه‌ای برای انتشار وجود ندارد"
             exit 0
           fi
-          
-          git commit -m "Add downloaded media from Telegram [skip ci]"
-          
+
+          git commit -m "⬇️ فایل‌های دانلودشده از تلگرام [skip ci]"
+
           for attempt in 1 2 3; do
-            if git push origin main 2>&1; then
-              echo "✅ Successfully deployed to repository"
+            if git push origin "${{ github.ref_name }}" 2>&1; then
+              echo "✅ با موفقیت در مخزن منتشر شد"
               break
             else
               if [ $attempt -lt 3 ]; then
-                echo "⚠️ Push failed, retry $attempt/3..."
-                git pull origin main --rebase
+                echo "⚠️ تلاش $attempt ناموفق، در حال rebase و تکرار..."
+                git pull origin "${{ github.ref_name }}" --rebase
                 sleep 5
               else
-                echo "❌ Failed to push after 3 attempts"
+                echo "❌ انتشار پس از ۳ تلاش شکست خورد"
                 exit 1
               fi
             fi
           done
 
-      - name: 📋 Download report
+      # ------------------------------------------------------------
+      # گزارش نهایی
+      # ------------------------------------------------------------
+      - name: 📋 گزارش نهایی
         if: always()
         run: |
           echo ""
-          echo "┌─────────────────────────────────────────────────────────────┐"
-          echo "│              Telegram Downloader Summary                  │"
-          echo "├─────────────────────────────────────────────────────────────┤"
-          echo "│ 🔗 Total links: ${{ steps.process_all.outputs.success_count }} succeeded, ${{ steps.process_all.outputs.fail_count }} failed"
-          echo "│ 📁 Location: ./downloads/"
-          echo "│ 📝 Each folder has github_links.txt with GitHub raw download links"
-          echo "│ 🧹 File names are cleaned (no spaces or special chars)"
-          echo "└─────────────────────────────────────────────────────────────┘"
-          
-          echo ""
-          echo "📂 Folder structure:"
+          echo "┌──────────────────────────────────────────────┐"
+          echo "│          Telegram Downloader Summary         │"
+          echo "├──────────────────────────────────────────────┤"
+          echo "│ ✅ دانلود موفق: ${{ steps.download_all.outputs.success_count }}"
+          echo "│ ❌ ناموفق: ${{ steps.download_all.outputs.fail_count }}"
+          echo "│ 📁 مسیر فایل‌ها: ./downloads/<folder>/"
+          echo "│ 🔗 لینک‌های مستقیم در فایل github_links.txt"
+          echo "└──────────────────────────────────────────────┘"
+          echo "📂 ساختار پوشه‌ها:"
           find downloads -type f -name "github_links.txt" 2>/dev/null | head -10
-          
           echo ""
-          echo "📄 Sample files:"
+          echo "📄 نمونه فایل‌های دانلودشده:"
           find downloads -type f ! -name "github_links.txt" 2>/dev/null | head -10
