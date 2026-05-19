@@ -1,14 +1,14 @@
-name: TelegramDownloader-Ultimate
+name: Telegram Single Downloader (Robust)
 
 on:
   workflow_dispatch:
     inputs:
-      telegram_links:
-        description: '🔗 لینک پست‌های تلگرام (با فاصله جدا کنید)'
+      telegram_link:
+        description: '🔗 لینک پست تلگرام (فقط یک لینک)'
         required: true
         type: string
       split_threshold_mb:
-        description: '📦 حداکثر حجم هر بخش (مگابایت)'
+        description: '📦 حداکثر حجم هر قطعه (مگابایت) - 0 یعنی تقسیم نشود'
         required: false
         type: number
         default: 90
@@ -19,8 +19,9 @@ on:
         default: 5
 
 jobs:
-  harvest:
+  download:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
       contents: write
 
@@ -30,99 +31,163 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: ⚡ نصب ابزارها
+      - name: ⚡ نصب پیش‌نیازها
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl jq zip unzip bc aria2 p7zip-full
 
-      # کش پروکسی‌های ذخیره‌شده
+      # ──────────────────────────────────────────────
+      #  کش پروکسی‌ها با actions/cache
+      # ──────────────────────────────────────────────
       - name: 💾 بازیابی کش پروکسی‌ها
-        id: cache-proxy
+        id: cache-proxies
         uses: actions/cache@v4
         with:
           path: .proxy_cache
-          key: telegram-proxies-${{ hashFiles('.github/workflows/*.yml') }}-v2
+          key: proxies-v1-${{ hashFiles('.github/workflows/*.yml') }}
           restore-keys: |
-            telegram-proxies-
+            proxies-v1-
 
-      - name: 🚀 کشف/تأیید چندین پروکسی فعال
-        id: proxy
+      # ──────────────────────────────────────────────
+      #  کشف و تأیید پروکسی‌های سالم (با تست دانلود)
+      # ──────────────────────────────────────────────
+      - name: 🔍 کشف پروکسی‌های قوی
+        id: discover
         run: |
           mkdir -p .proxy_cache
-          PROXY_FILE=".proxy_cache/working_proxies.txt"
+          PROXY_FILE=".proxy_cache/alive_proxies.txt"
           NEEDED=${{ github.event.inputs.proxy_count }}
           FOUND=0
-          SELECTED_LIST=()
+          declare -a ALIVE=()
 
-          # اگر فایل پروکسی‌های کش وجود داشت، آن‌ها را تست کنیم
+          # 1) تست اتصال مستقیم
+          echo "══════════════════════════════════════════════"
+          echo "🌐 تست اتصال مستقیم (DIRECT)"
+          echo "══════════════════════════════════════════════"
+          if curl -s --max-time 10 --connect-timeout 5 \
+            'https://telegramdownloader.net/proxy.php' \
+            -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' --compressed 2>/dev/null | grep -q '"success"'; then
+            echo "✅ اتصال مستقیم پاسخ داد – اولویت اول"
+            ALIVE+=("DIRECT")
+            FOUND=1
+          else
+            echo "⚠️ اتصال مستقیم در دسترس نیست"
+          fi
+
+          # 2) اگر پروکسی کش شده داریم تست کنیم
           if [ -f "$PROXY_FILE" ]; then
-            echo "🔍 بررسی پروکسی‌های ذخیره‌شده..."
+            echo "🔄 بررسی پروکسی‌های کش‌شده..."
             while IFS= read -r proxy; do
-              if curl -s -x "http://$proxy" --max-time 5 --connect-timeout 3 -k \
-                'https://telegramdownloader.net/proxy.php' -X POST \
-                -H 'Content-Type: application/x-www-form-urlencoded' \
+              [ -z "$proxy" ] && continue
+              echo -n "  ▪ تست $proxy ... "
+              if curl -s -x "http://$proxy" --max-time 10 --connect-timeout 5 \
+                'https://telegramdownloader.net/proxy.php' \
+                -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
                 --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' --compressed 2>/dev/null | grep -q '"success"'; then
-                echo "✅ پروکسی سالم: $proxy"
-                SELECTED_LIST+=("$proxy")
+                echo "✅"
+                ALIVE+=("$proxy")
                 FOUND=$((FOUND+1))
-                if [ $FOUND -ge $NEEDED ]; then break; fi
+                [ $FOUND -ge $NEEDED ] && break
               else
-                echo "❌ پروکسی مرده: $proxy"
+                echo "❌"
               fi
             done < "$PROXY_FILE"
           fi
 
-          # اگر به اندازۀ کافی پیدا نشد، لیست جدید بگیریم
+          # 3) اگر هنوز به تعداد نیاز داریم، لیست جدید بگیریم و تست کنیم
           if [ $FOUND -lt $NEEDED ]; then
-            echo "🔍 دانلود لیست پروکسی جدید..."
-            curl -s 'https://raw.githubusercontent.com/Ian-Lusule/Proxies/main/proxies/http.txt' | \
-              grep -vE '^(0\.0\.0\.0|127\.0\.0\.1)' | head -1000 > proxy_list.txt
+            echo "📥 دریافت لیست پروکسی جدید..."
+            curl -s --max-time 15 'https://raw.githubusercontent.com/Ian-Lusule/Proxies/main/proxies/http.txt' \
+              | grep -vE '^(0\.0\.0\.0|127\.0\.0\.1)' | head -1000 > proxy_list.txt
 
-            # تست موازی با ۲۰ نخ هم‌زمان، اولین ۵ پروکسی سالم را بگیریم
-            # هر پروکسی که جواب بدهد، در یک فایل موقت ثبت شود
-            TEST_DIR=$(mktemp -d)
-            cat proxy_list.txt | xargs -P 20 -I {} bash -c '
+            echo "⚡ تست همزمان پروکسی‌ها (هر کدام ۸ ثانیه فرصت)..."
+            # تست موازی با ۱۰ نخ، هر کدام ۸ ثانیه timeout
+            cat proxy_list.txt | xargs -P 10 -I {} bash -c '
               proxy="{}"
-              if curl -s -x "http://$proxy" --max-time 4 --connect-timeout 2 -k \
-                "https://telegramdownloader.net/proxy.php" -X POST \
-                -H "Content-Type: application/x-www-form-urlencoded" \
+              if curl -s -x "http://$proxy" --max-time 8 --connect-timeout 4 --retry 0 -k \
+                "https://telegramdownloader.net/proxy.php" \
+                -X POST -H "Content-Type: application/x-www-form-urlencoded" \
                 --data-raw "telegram_link=https%3A%2F%2Ft.me%2Ftest" --compressed 2>/dev/null | grep -q "\"success\""; then
-                echo "$proxy" >> '"$TEST_DIR"'/alive.txt
+                echo "$proxy" >> found_proxies.txt
               fi
             ' 2>/dev/null
 
-            # خواندن پروکسی‌های سالم به ترتیب (اولین‌هایی که جواب دادند)
-            if [ -f "$TEST_DIR/alive.txt" ]; then
+            if [ -f found_proxies.txt ]; then
               while IFS= read -r proxy; do
                 if [ $FOUND -lt $NEEDED ]; then
-                  SELECTED_LIST+=("$proxy")
+                  echo "✅ پروکسی زنده: $proxy"
+                  ALIVE+=("$proxy")
                   FOUND=$((FOUND+1))
                 else
                   break
                 fi
-              done < "$TEST_DIR/alive.txt"
+              done < found_proxies.txt
+              rm found_proxies.txt
             fi
-            rm -rf "$TEST_DIR"
           fi
 
-          # اگر هیچ پروکسی پیدا نشد، اتصال مستقیم
-          if [ $FOUND -eq 0 ]; then
-            echo "DIRECT" > "$PROXY_FILE"
-            echo "ℹ️ هیچ پروکسی سالمی پیدا نشد – استفاده از اتصال مستقیم"
-          else
-            # ذخیره لیست پروکسی‌های سالم برای کش
-            printf "%s\n" "${SELECTED_LIST[@]}" > "$PROXY_FILE"
-            echo "🎯 تعداد پروکسی سالم ذخیره‌شده: ${#SELECTED_LIST[@]}"
+          # 4) تست عملی دانلود یک فایل کوچک با هر پروکسی (تضمین کیفیت)
+          echo "══════════════════════════════════════════════"
+          echo "🔬 تست دانلود واقعی با پروکسی‌های منتخب"
+          echo "══════════════════════════════════════════════"
+          FINAL_PROXIES=()
+          for proxy in "${ALIVE[@]}"; do
+            echo -n "  🧪 $proxy : دریافت لینک تست..."
+            if [ "$proxy" = "DIRECT" ]; then
+              RESP=$(curl -s --max-time 15 -X POST \
+                -H 'Content-Type: application/x-www-form-urlencoded' \
+                --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' \
+                --compressed https://telegramdownloader.net/proxy.php)
+            else
+              RESP=$(curl -s -x "http://$proxy" --max-time 15 -X POST \
+                -H 'Content-Type: application/x-www-form-urlencoded' \
+                --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' \
+                --compressed https://telegramdownloader.net/proxy.php)
+            fi
+            TEST_URL=$(echo "$RESP" | jq -r '.data.data.link')
+            if [ -z "$TEST_URL" ] || [ "$TEST_URL" = "null" ]; then
+              echo "⛔ لینک تست دریافت نشد"
+              continue
+            fi
+            echo -n " | دانلود ۵۱۲ کیلوبایت..."
+            if [ "$proxy" = "DIRECT" ]; then
+              aria2c --max-connection-per-server=1 --split=1 --max-tries=2 --timeout=15 \
+                --connect-timeout=10 --allow-overwrite=true --quiet \
+                --dir=/tmp --out="test_$RANDOM" "$TEST_URL" --max-download-limit=512K --stop-with-process=512K 2>/dev/null
+            else
+              aria2c --max-connection-per-server=1 --split=1 --max-tries=2 --timeout=15 \
+                --connect-timeout=10 --allow-overwrite=true --quiet \
+                --all-proxy="http://$proxy" --dir=/tmp --out="test_$RANDOM" "$TEST_URL" \
+                --max-download-limit=512K --stop-with-process=512K 2>/dev/null
+            fi
+            if [ $? -eq 0 ]; then
+              echo " ✅"
+              FINAL_PROXIES+=("$proxy")
+            else
+              echo " ❌"
+            fi
+          done
+
+          # اگر پروکسی قابل‌قبولی نماند، DIRECT را امتحان می‌کنیم (حتی اگر در تست اول رد شد)
+          if [ ${#FINAL_PROXIES[@]} -eq 0 ]; then
+            echo "⚠️ هیچ پروکسی تست دانلود را رد نکرد. استفاده از DIRECT به‌عنوان آخرین راه"
+            FINAL_PROXIES=("DIRECT")
           fi
 
-          # خروجی برای مراحل بعد: فایل حاوی پروکسی‌ها (یا DIRECT)
+          printf "%s\n" "${FINAL_PROXIES[@]}" > "$PROXY_FILE"
+          echo "🎯 پروکسی‌های نهایی (${#FINAL_PROXIES[@]} عدد):"
+          cat "$PROXY_FILE"
           echo "proxy_file=$PROXY_FILE" >> $GITHUB_OUTPUT
 
-      - name: 📡 دانلود موازی لینک‌ها با fallback پروکسی
-        id: download_all
+      # ──────────────────────────────────────────────
+      #  دانلود اصلی با گردش روی پروکسی‌ها
+      # ──────────────────────────────────────────────
+      - name: 📥 دانلود هوشمند فایل
+        id: download
         run: |
-          LINKS="${{ github.event.inputs.telegram_links }}"
-          PROXY_FILE="${{ steps.proxy.outputs.proxy_file }}"
+          LINK="${{ github.event.inputs.telegram_link }}"
+          PROXY_FILE="${{ steps.discover.outputs.proxy_file }}"
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
@@ -136,210 +201,170 @@ jobs:
           sanitize_name() { echo "$1" | sed 's/%20/-/g; s/%40/@/g; s/[[:space:]]/-/g; s/--*/-/g; s/[^a-zA-Z0-9.@_-]//g'; }
           urlencode() { python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
-          # تابع دانلود یک لینک (با fallback پروکسی‌ها)
-          download_one() {
-            local TELEGRAM_LINK="$1"
-            local INDEX="$2"
-            local LOGFILE="logs/link_${INDEX}.log"
-            exec 3>&1 4>&2
-            exec > "$LOGFILE" 2>&1
+          mapfile -t PROXIES < "$PROXY_FILE"
+          SUCCESS=0
+          ATTEMPT=0
 
-            echo "شروع دانلود #$INDEX: $TELEGRAM_LINK"
+          for PROXY in "${PROXIES[@]}"; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo ""
+            echo "══════════════════════════════════════════════"
+            echo "🔄 تلاش $ATTEMPT با پروکسی: $PROXY"
+            echo "══════════════════════════════════════════════"
 
-            # خواندن پروکسی‌ها (هر خط یک پروکسی یا کلمۀ DIRECT)
-            mapfile -t PROXIES < "$PROXY_FILE"
+            # 1) دریافت لینک دانلود
+            echo "⚡ دریافت اطلاعات فایل..."
+            if [ "$PROXY" = "DIRECT" ]; then
+              RESPONSE=$(curl -s --max-time 20 --connect-timeout 10 -X POST \
+                -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
+                -H 'Content-Type: application/x-www-form-urlencoded' \
+                --data-raw "telegram_link=$LINK" --compressed \
+                https://telegramdownloader.net/proxy.php)
+            else
+              RESPONSE=$(curl -s -x "http://$PROXY" --max-time 20 --connect-timeout 10 -X POST \
+                -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
+                -H 'Content-Type: application/x-www-form-urlencoded' \
+                --data-raw "telegram_link=$LINK" --compressed \
+                https://telegramdownloader.net/proxy.php)
+            fi
 
-            DOWNLOAD_OK=false
-            for PROXY in "${PROXIES[@]}"; do
-              [ -z "$PROXY" ] && continue
-              echo "🔄 تلاش با پروکسی: $PROXY"
+            RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
+            ORIGINAL_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
 
-              # دریافت لینک دانلود با پروکسی فعلی
-              if [ "$PROXY" = "DIRECT" ]; then
-                RESPONSE=$(curl -s -X POST \
-                  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  -H "Content-Type: application/x-www-form-urlencoded" \
-                  --data-raw "telegram_link=$TELEGRAM_LINK" \
-                  --compressed https://telegramdownloader.net/proxy.php)
-              else
-                RESPONSE=$(curl -s -x "http://$PROXY" -X POST \
-                  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  -H "Content-Type: application/x-www-form-urlencoded" \
-                  --data-raw "telegram_link=$TELEGRAM_LINK" \
-                  --compressed https://telegramdownloader.net/proxy.php)
-              fi
+            if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+              echo "❌ دریافت لینک ناموفق - پروکسی بعدی"
+              continue
+            fi
 
-              RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
-              ORIGINAL_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+            echo "📄 نام فایل: $ORIGINAL_NAME"
+            echo "🔗 لینک مستقیم دریافت شد"
 
-              if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-                echo "⚠️ دریافت لینک ناموفق، پروکسی بعدی..."
-                continue
-              fi
+            CLEAN_NAME=$(sanitize_name "$ORIGINAL_NAME")
+            FOLDER_NAME=$(safe_folder "${CLEAN_NAME%.*}")
+            DOWNLOAD_DIR="downloads/$FOLDER_NAME"
+            mkdir -p "$DOWNLOAD_DIR"
+            FIXED_URL=$(fix_url "$RAW_URL")
 
-              CLEAN_NAME=$(sanitize_name "$ORIGINAL_NAME")
-              FOLDER_NAME=$(safe_folder "${CLEAN_NAME%.*}")
-              DOWNLOAD_DIR="downloads/$FOLDER_NAME"
-              mkdir -p "$DOWNLOAD_DIR"
+            # 2) دانلود فایل با aria2c
+            echo "📥 شروع دانلود..."
+            ARIA2_OPTS=(--max-connection-per-server=8 --split=8 --min-split-size=10M
+                        --max-tries=5 --retry-wait=5 --timeout=120 --connect-timeout=30
+                        --allow-overwrite=true --auto-file-renaming=false
+                        --console-log-level=notice --summary-interval=5
+                        --dir="$DOWNLOAD_DIR" --out="$ORIGINAL_NAME")
 
-              echo "📥 دانلود فایل: $ORIGINAL_NAME"
-              FIXED_URL=$(fix_url "$RAW_URL")
+            if [ "$PROXY" != "DIRECT" ]; then
+              ARIA2_OPTS+=(--all-proxy="http://$PROXY")
+            fi
 
-              # دانلود با aria2c (با پروکسی فعلی در صورت نیاز)
-              ARIA2_OPTS=(--max-connection-per-server=8 --split=8 --min-split-size=5M
-                          --max-tries=3 --retry-wait=3 --timeout=120 --connect-timeout=30
-                          --allow-overwrite=true --auto-file-renaming=false --console-log-level=error
-                          --dir="$DOWNLOAD_DIR" --out="$ORIGINAL_NAME")
-              if [ "$PROXY" != "DIRECT" ]; then
-                ARIA2_OPTS+=(--all-proxy="http://$PROXY")
-              fi
+            aria2c "${ARIA2_OPTS[@]}" "$FIXED_URL"
+            ARIA_EXIT=$?
 
-              if aria2c "${ARIA2_OPTS[@]}" "$FIXED_URL"; then
-                # موفقیت
-                if [ "$ORIGINAL_NAME" != "$CLEAN_NAME" ]; then
-                  mv "$DOWNLOAD_DIR/$ORIGINAL_NAME" "$DOWNLOAD_DIR/$CLEAN_NAME"
-                fi
-                FILE_SIZE=$(stat -c%s "$DOWNLOAD_DIR/$CLEAN_NAME")
-                if [ "$FILE_SIZE" -lt 10000 ]; then
-                  echo "❌ فایل خیلی کوچک است، پروکسی بعدی..."
-                  rm -f "$DOWNLOAD_DIR/$CLEAN_NAME"
-                  continue
-                fi
-                DOWNLOAD_OK=true
-                break
-              else
-                echo "⚠️ دانلود ناموفق، پروکسی بعدی..."
-                # پاکسازی فایل ناقص
-                rm -f "$DOWNLOAD_DIR/$ORIGINAL_NAME" "$DOWNLOAD_DIR/$CLEAN_NAME"
-              fi
-            done
+            if [ $ARIA_EXIT -ne 0 ]; then
+              echo "❌ aria2c با کد $ARIA_EXIT شکست خورد - پروکسی بعدی"
+              rm -f "$DOWNLOAD_DIR/$ORIGINAL_NAME"
+              continue
+            fi
 
-            if [ "$DOWNLOAD_OK" = false ]; then
-              echo "FAILED:ALL_PROXIES" > "logs/status_${INDEX}.txt"
-              exec 1>&3 2>&4
-              return 1
+            # 3) بررسی حجم فایل
+            if [ "$ORIGINAL_NAME" != "$CLEAN_NAME" ]; then
+              mv "$DOWNLOAD_DIR/$ORIGINAL_NAME" "$DOWNLOAD_DIR/$CLEAN_NAME"
+            fi
+
+            FILE_SIZE=$(stat -c%s "$DOWNLOAD_DIR/$CLEAN_NAME")
+            if [ "$FILE_SIZE" -lt 10000 ]; then
+              echo "❌ فایل دریافت‌شده بسیار کوچک است (${FILE_SIZE} بایت) - پروکسی بعدی"
+              rm -f "$DOWNLOAD_DIR/$CLEAN_NAME"
+              continue
             fi
 
             SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-            echo "✅ دانلود شد: ${SIZE_MB} مگابایت - $CLEAN_NAME"
+            echo "✅ دانلود موفق! حجم: ${SIZE_MB} مگابایت"
+            SUCCESS=1
+            break
+          done
 
-            # فشرده‌سازی با 7z در صورت بزرگ‌تر بودن از حد
-            SPLIT_FILES=()
-            LIMIT=$((THRESHOLD_MB * 1024 * 1024))
-            if [ "$FILE_SIZE" -gt "$LIMIT" ] && [ "$THRESHOLD_MB" != "0" ]; then
-              echo "✂️ تقسیم فایل با 7z به حجم ${THRESHOLD_MB}مگ..."
-              ARCHIVE="${CLEAN_NAME}.7z"
-              # 7z با حجم مشخص (بایت) تقسیم می‌کند: -v${THRESHOLD_MB}m
-              7z a -v${THRESHOLD_MB}m "$DOWNLOAD_DIR/$ARCHIVE" "$DOWNLOAD_DIR/$CLEAN_NAME" >/dev/null
-              if [ $? -eq 0 ]; then
-                rm -f "$DOWNLOAD_DIR/$CLEAN_NAME"  # حذف فایل اصلی
-                # قطعات تولیدشده: archive.7z.001, archive.7z.002, ...
-                for part in "$DOWNLOAD_DIR/$ARCHIVE".*; do
-                  SPLIT_FILES+=("$(basename "$part")")
-                done
-                # اگر فقط یک بخش تولید شد (حجم کمتر از حد) خود archive.7z است که پسوند .001 ندارد
-                if [ ${#SPLIT_FILES[@]} -eq 0 ]; then
-                  # ممکن است 7z یک فایل .7z بدون قطعه ساخته باشد
-                  if [ -f "$DOWNLOAD_DIR/$ARCHIVE" ]; then
-                    SPLIT_FILES+=("$ARCHIVE")
-                  fi
-                fi
-              else
-                echo "❌ خطا در فشرده‌سازی، فایل اصلی نگه داشته می‌شود."
-                SPLIT_FILES=("$CLEAN_NAME")
+          if [ $SUCCESS -eq 0 ]; then
+            echo "⛔ تمام پروکسی‌ها شکست خوردند!"
+            exit 1
+          fi
+
+          # ── تقسیم فایل با 7z در صورت نیاز ──
+          SPLIT_FILES=()
+          LIMIT=$((THRESHOLD_MB * 1024 * 1024))
+          if [ "$FILE_SIZE" -gt "$LIMIT" ] && [ "$THRESHOLD_MB" != "0" ]; then
+            echo "✂️ تقسیم فایل به قطعات ${THRESHOLD_MB}مگی با 7z..."
+            ARCHIVE="${CLEAN_NAME}.7z"
+            7z a -v${THRESHOLD_MB}m "$DOWNLOAD_DIR/$ARCHIVE" "$DOWNLOAD_DIR/$CLEAN_NAME" >/dev/null
+            if [ $? -eq 0 ]; then
+              rm -f "$DOWNLOAD_DIR/$CLEAN_NAME"
+              # جمع‌آوری قطعات
+              for part in "$DOWNLOAD_DIR/$ARCHIVE".*; do
+                [ -f "$part" ] && SPLIT_FILES+=("$(basename "$part")")
+              done
+              if [ ${#SPLIT_FILES[@]} -eq 0 ] && [ -f "$DOWNLOAD_DIR/$ARCHIVE" ]; then
+                SPLIT_FILES+=("$ARCHIVE")
               fi
+              echo "📦 تعداد قطعات: ${#SPLIT_FILES[@]}"
             else
+              echo "⚠️ خطا در ساخت 7z، فایل اصلی باقی می‌ماند."
               SPLIT_FILES=("$CLEAN_NAME")
             fi
+          else
+            SPLIT_FILES=("$CLEAN_NAME")
+          fi
 
-            # ساخت فایل لینک‌های گیت‌هاب
-            GITHUB_LINKS_FILE="$DOWNLOAD_DIR/github_links.txt"
-            ENCODED_FOLDER=$(urlencode "$FOLDER_NAME")
-            > "$GITHUB_LINKS_FILE"
-            for file in "${SPLIT_FILES[@]}"; do
-              ENCODED_FILE=$(urlencode "$file")
-              echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/downloads/${ENCODED_FOLDER}/${ENCODED_FILE}" >> "$GITHUB_LINKS_FILE"
-            done
-
-            echo "SUCCESS" > "logs/status_${INDEX}.txt"
-            exec 1>&3 2>&4
-            return 0
-          }
-
-          # اجرای موازی همه لینک‌ها
-          declare -a PIDS
-          IFS=' ' read -ra LINKS_ARRAY <<< "$LINKS"
-          TOTAL_LINKS=${#LINKS_ARRAY[@]}
-          echo "🚀 شروع دانلود $TOTAL_LINKS لینک به‌صورت همزمان..."
-
-          for i in "${!LINKS_ARRAY[@]}"; do
-            INDEX=$((i + 1))
-            download_one "${LINKS_ARRAY[$i]}" "$INDEX" &
-            PIDS[$i]=$!
+          # ── ساخت فایل لینک‌های گیت‌هاب ──
+          GITHUB_LINKS_FILE="$DOWNLOAD_DIR/github_links.txt"
+          ENCODED_FOLDER=$(urlencode "$FOLDER_NAME")
+          > "$GITHUB_LINKS_FILE"
+          for file in "${SPLIT_FILES[@]}"; do
+            ENCODED_FILE=$(urlencode "$file")
+            echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/downloads/${ENCODED_FOLDER}/${ENCODED_FILE}" >> "$GITHUB_LINKS_FILE"
           done
 
-          for pid in "${PIDS[@]}"; do
-            wait "$pid"
-          done
+          echo "📝 لینک‌های دانلود در github_links.txt ذخیره شدند."
+          cat "$GITHUB_LINKS_FILE"
+          echo "download_folder=$DOWNLOAD_DIR" >> $GITHUB_OUTPUT
 
-          SUCCESS=0
-          FAIL=0
-          for i in $(seq 1 $TOTAL_LINKS); do
-            if [ -f "logs/status_${i}.txt" ]; then
-              STATUS=$(cat "logs/status_${i}.txt")
-              if [ "$STATUS" = "SUCCESS" ]; then
-                SUCCESS=$((SUCCESS + 1))
-              else
-                FAIL=$((FAIL + 1))
-              fi
-            else
-              FAIL=$((FAIL + 1))
-            fi
-          done
-
-          echo "success_count=$SUCCESS" >> $GITHUB_OUTPUT
-          echo "fail_count=$FAIL" >> $GITHUB_OUTPUT
-          echo "📊 دانلودها تمام شدند: $SUCCESS موفق، $FAIL ناموفق"
-
-      - name: 📤 انتشار در مخزن
-        if: steps.download_all.outputs.success_count > 0
+      # ──────────────────────────────────────────────
+      #  انتشار فایل‌ها در مخزن
+      # ──────────────────────────────────────────────
+      - name: 📤 انتشار در ریپازیتوری
+        if: success()
         run: |
-          git config user.name "TelegramDownloader-bot"
-          git config user.email "telegramdownloader@local"
+          git config user.name "Telegram-Downloader-Bot"
+          git config user.email "bot@telegram.dl"
           git fetch origin "${{ github.ref_name }}"
           git pull origin "${{ github.ref_name }}" --rebase || true
-          git add downloads/ logs/ 2>/dev/null || true
+          git add downloads/ .proxy_cache/ 2>/dev/null || true
           if git diff --cached --quiet; then
-            echo "✅ تغییر تازه‌ای وجود ندارد"
+            echo "✅ بدون تغییر جدید"
             exit 0
           fi
-          git commit -m "⬇️ فایل‌های دانلودشده از تلگرام [skip ci]"
-          for attempt in 1 2 3; do
-            if git push origin "${{ github.ref_name }}" 2>&1; then
-              echo "✅ با موفقیت منتشر شد"
+          git commit -m "📥 فایل دانلودشده از تلگرام [skip ci]"
+          for i in 1 2 3; do
+            if git push origin "${{ github.ref_name }}"; then
+              echo "✅ انتشار موفق"
               break
             else
-              if [ $attempt -lt 3 ]; then
-                echo "⚠️ تلاش $attempt ناموفق، rebase و تکرار..."
-                git pull origin "${{ github.ref_name }}" --rebase
-                sleep 5
-              else
-                echo "❌ انتشار شکست خورد"
-                exit 1
-              fi
+              echo "⚠️ تلاش $i ناموفق، در حال rebase..."
+              git pull origin "${{ github.ref_name }}" --rebase
+              sleep 5
             fi
           done
 
-      - name: 📋 گزارش نهایی
+      # ──────────────────────────────────────────────
+      #  گزارش نهایی
+      # ──────────────────────────────────────────────
+      - name: 📋 خلاصه عملیات
         if: always()
         run: |
-          echo ""
-          echo "┌──────────────────────────────────────────────┐"
-          echo "│          Telegram Downloader Ultimate        │"
-          echo "├──────────────────────────────────────────────┤"
-          echo "│ ✅ دانلود موفق: ${{ steps.download_all.outputs.success_count }}"
-          echo "│ ❌ ناموفق: ${{ steps.download_all.outputs.fail_count }}"
-          echo "│ 📁 مسیر فایل‌ها: ./downloads/<folder>/"
-          echo "│ 🗜️ فشرده‌سازی با 7z (حجم کمتر)"
-          echo "│ 🔁 Fallback خودکار بین چند پروکسی"
-          echo "└──────────────────────────────────────────────┘"
+          echo "┌─────────────────────────────────────────────┐"
+          echo "│         📊 گزارش دانلود هوشمند              │"
+          echo "├─────────────────────────────────────────────┤"
+          echo "│ لینک: ${{ github.event.inputs.telegram_link }}"
+          echo "│ پوشه مقصد: ${{ steps.download.outputs.download_folder }}"
+          echo "│ فایل‌های نهایی:"
+          ls -lh ${{ steps.download.outputs.download_folder }}/ 2>/dev/null | tail -n +2
+          echo "└─────────────────────────────────────────────┘"
